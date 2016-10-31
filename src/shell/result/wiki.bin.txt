@@ -1,0 +1,52 @@
+Reading File ... 3466.76 ms 
+Begin Experiments on Graph (V=2394385 E=5021410 File='../data/wiki.bin')
+-------------------------------------------------------------------
+	Time	Total	Tips
+	90.88	cpu_bfs_vertex	Step=7
+	4.34	163.46	gpu_bfs_edge	step=7	Check PASS
+	4.14	20.19	gpu_bfs_edge_loop	step=7	Check PASS
+	163.36	175.78	gpu_bfs_vertex	step=7	Check PASS
+	159.12	171.70	gpu_bfs_vertex_loop	step=7	Check PASS
+-------------------------------------------------------------------
+	Time	Total	Tips
+	150.78	cpu_cc_vertex_uf
+Number of Connected Components: 2555
+	ID	Root	N
+	0	0	2388953
+	1	13192	2
+	2	13715	2
+	3	13773	2
+	4	14232	2
+	5	14651	2
+	6	17965	2
+	7	19948	2
+	8	22354	2
+	9	26273	2
+	10	28077	2
+	11	34759	2
+	12	37523	2
+	13	41605	2
+	14	42456	2
+	15	47063	2
+	16	48233	2
+	17	48388	2
+	18	50514	2
+	19	51966	2
+	20	53378	2
+	...
+	167.74	cpu_cc_vertex
+	9.93	34.06	gpu_cc_edge	Step=5	Check PASS
+	10.49	32.20	gpu_cc_edge_loop	Step=5	Check PASS
+	534.70	553.55	gpu_cc_vertex	Step=6	Check PASS
+	470.37	489.81	gpu_cc_vertex_loop	Step=6	Check PASS
+-------------------------------------------------------------------
+Partitioning ... 75.63 ms ... Get partitions ... 50.79 ms
+	Time	Total	Tips
+	183.90	sssp_on_cpu	step=2
+	11.95	47.42	sssp_edge_part_loop	step=4	Check PASS
+-------------------------------------------------------------------
+Partitioning ... 110.76 msGet partitions  ... 62.71 ms
+	Time	Total	Tips
+	213.68	37.20	pagerank_vertex_loop	step=19	
+-------------------------------------------------------------------
+Done Experiments

@@ -47,7 +47,7 @@ static void check_values(const int * const v1, const int * const v2, int n) {
     printf("Check PASS\n");
 }
 
-static void bfs_on_cpu(
+static void cpu_bfs_vertex(
     const int vertex_num,
     const int * const vertex_begin,
     const int * const edge_dest,
@@ -84,7 +84,50 @@ static void bfs_on_cpu(
             }
         }
     }
-    printf("\t%.2f\tBFS on CPU\tStep=%d\tVisited=%d\n", timer_stop(), step, outcount);
+    printf("\t%.2f\tcpu_bfs_vertex\tStep=%d\n", timer_stop(), step);
+    free(queue);
+}
+
+static void cpu_bfs_edge(
+    const int edge_num,
+	const int vertex_num,
+    const int * const edge_src,
+    const int * const edge_dest,
+    int * const values,
+    const int first_vertex
+) {
+
+    timer_start();
+    // for simplicity, use a large but simple queue instead of a small full functional queue)
+    int * queue = (int *)calloc(vertex_num, sizeof(int));
+    if (queue == NULL) {
+        perror("Out of memory");
+        exit(1);
+    }
+    // the position to put next enqueue element & get next dequeue element
+    int incount = 0;
+    int outcount = 0;
+    // initialization
+    memset(values, 0, vertex_num * sizeof(int));
+    values[first_vertex] = 1;
+    queue[incount++] = first_vertex;
+
+    int step = 0;
+    while (incount > outcount) {
+        // dequeue the vertex to be visited
+        int v = queue[outcount++];
+        step = values[v];
+        for (int e=0; e < edge_num; e++) {
+            int src = edge_src[e];
+            int dest= edge_dest[e];
+            if (src ==v && values[dest] == 0) {
+                // enqueue the vertex will be visited
+                values[dest] = step + 1;
+                queue[incount++] = dest;
+            }
+        }
+    }
+    printf("\t%.2f\tcpu_bfs_edge\tStep=%d\n", timer_stop(), step);
     free(queue);
 }
 
@@ -114,6 +157,71 @@ static __global__ void kernel_edge_loop(
     }
     // update flag
     if (flag == 1) *continue_flag = 1;
+}
+
+// BFS kernel run on edges without inner loop
+static __global__ void kernel_edge(
+        const int edge_num,
+        const int * const edge_src,
+        const int * const edge_dest,
+        int * const values,
+        const int step,
+        int * const continue_flag
+) {
+    int index = threadIdx.x + blockIdx.x * blockDim.x;
+    // step counter
+    int curStep = step;
+    int nextStep = curStep + 1;
+    // proceeding loop
+    if(index < edge_num) {
+        if (values[edge_src[index]] == curStep && values[edge_dest[index]] == 0) {
+            values[edge_dest[index]] = nextStep;
+            *continue_flag=1;
+		}
+	}
+}
+// BFS algorithm on graph g, not partitioned, run on edges with inner loop
+static void gpu_bfs_edge(
+		const Graph * const g,
+		int * const values,
+		int const first_vertex
+		) {
+	int step = 1, flag = 0;
+	float bfsTime = 0.0;
+	timer_start();
+    int vertex_num = g->vertex_num;
+    int edge_num = g->edge_num;
+    Auto_Utility();
+    // Allocate GPU buffer
+    CudaBufferCopy(int, dev_edge_src, edge_num, g->edge_src);
+    CudaBufferCopy(int, dev_edge_dest, edge_num, g->edge_dest);
+    CudaBufferZero(int, dev_value, vertex_num);
+    CudaBufferZero(int, dev_continue_flag, 1)
+    // Set Source Vertex Value (Little Endian)
+    CudaMemset(dev_value + first_vertex, 1, 1);
+    // Main Loop
+	do {
+		// Clear Flag
+		CudaMemset(dev_continue_flag, 0, sizeof(int));
+		// Launch Kernel for this Iteration
+		CudaTimerBegin();
+		kernel_edge<<<(edge_num + 255) / 256, 256>>>
+			(
+			 edge_num,
+			 dev_edge_src,
+			 dev_edge_dest,
+			 dev_value,
+			 step,
+			 dev_continue_flag
+			);
+		bfsTime += CudaTimerEnd();
+		// Copy Back Flag
+		CudaMemcpyD2H(&flag, dev_continue_flag, sizeof(int));
+		step++;
+	} while(flag);
+	// Copy Back Values
+	CudaMemcpyD2H(values, dev_value, vertex_num * sizeof(int));
+	printf("\t%.2f\t%.2f\tgpu_bfs_edge\tstep=%d\t", bfsTime, timer_stop(), step - 1);
 }
 
 // BFS algorithm on graph g, not partitioned, run on edges with inner loop
@@ -157,59 +265,10 @@ static void gpu_bfs_edge_loop(
     } while(flag);
     // Copy Back Values
     CudaMemcpyD2H(values, dev_value, vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tbfs_edge_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
+    printf("\t%.2f\t%.2f\tgpu_bfs_edge_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
 }
 
-// BFS algorithm on graph g, partitioned, run on edges with inner loop
-static void gpu_bfs_edge_part_loop(
-    const Graph * const * const g,
-    const struct part_table * const t,
-    int * const values,
-    int const first_vertex
-) {
-    int step = 1, flag = 0;
-    float bfsTime = 0.0;
-    timer_start();
-    Auto_Utility();
-    int part_num = t->part_num;
-    // Allocate GPU buffer
-    int ** dev_edge_src = (int **) Calloc(part_num, sizeof(int *));
-    int ** dev_edge_dest = (int **) Calloc(part_num, sizeof(int *));
-    for (int i = 0; i < part_num; i++) {
-        int size = g[i]->edge_num * sizeof(int);
-        CudaBufferFill(dev_edge_src[i], size, g[i]->edge_src);
-        CudaBufferFill(dev_edge_dest[i], size, g[i]->edge_dest);
-    }
-    CudaBufferZero(int, dev_value, t->vertex_num);
-    CudaBufferZero(int, dev_continue_flag, 1)
-    // Set Source Vertex Value (Little Endian)
-    CudaMemset(dev_value + first_vertex, 1, 1);
-    // Main Loop
-    do {
-        // Clear Flag
-        CudaMemset(dev_continue_flag, 0, sizeof(int));
-        // Launch Kernel for this Iteration
-        for (int i = 0; i < part_num; i++) {
-            CudaTimerBegin();
-            kernel_edge_loop<<<208, 128>>>
-            (
-                g[i]->edge_num,
-                dev_edge_src[i],
-                dev_edge_dest[i],
-                dev_value,
-                step,
-                dev_continue_flag
-            );
-            bfsTime += CudaTimerEnd();
-        }
-        // Copy Back Flag
-        CudaMemcpyD2H(&flag, dev_continue_flag, sizeof(int));
-        step++;
-    } while(flag);
-    // Copy Back Values
-    CudaMemcpyD2H(values, dev_value, t->vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tpart_edge_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
-}
+
 
 // BFS kernel run on vertices with inner loop
 static __global__ void kernel_vertex_loop(
@@ -309,7 +368,7 @@ static void gpu_bfs_vertex(
     } while(flag);
     // Copy Back Values
     CudaMemcpyD2H(values, dev_value, vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tbfs_vertex\tstep=%d\t", bfsTime, timer_stop(), step - 1);
+    printf("\t%.2f\t%.2f\tgpu_bfs_vertex\tstep=%d\t", bfsTime, timer_stop(), step - 1);
 }
 
 // BFS algorithm on graph g, not partitioned, run on vertices with inner loop
@@ -353,207 +412,15 @@ static void gpu_bfs_vertex_loop(
     } while(flag);
     // Copy Back Values
     CudaMemcpyD2H(values, dev_value, vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tbfs_vertex_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
+    printf("\t%.2f\t%.2f\tgpu_bfs_vertex_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
 }
 
-// BFS kernel run on vertices without inner loop, graph paritioned
-static __global__ void kernel_vertex_part(
-    const int vertex_num,
-    const int * const vertex_id,
-    const int * const vertex_begin,
-    const int * const edge_dest,
-    int * const values,
-    const int step,
-    int * const continue_flag
-) {
-    // total thread number & thread index of this thread
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    // proceed
-    if (index < vertex_num) {
-        int i = vertex_id[index];
-        if (values[i] == step) {
-            for (int k = vertex_begin[index]; k < vertex_begin[index + 1]; k++) {
-                int dest = edge_dest[k];
-                if (values[dest] == 0) {
-                    values[dest] = step + 1;
-                    *continue_flag = 1;
-                }
-            }
-        }
-    }
-}
-
-// BFS kernel run on vertices with inner loop, graph partitioned
-static __global__ void kernel_vertex_part_loop(
-    const int vertex_num,
-    const int * const vertex_id,
-    const int * const vertex_begin,
-    const int * const edge_dest,
-    int * const values,
-    const int step,
-    int * const continue_flag
-) {
-    // total thread number & thread index of this thread
-    int n = blockDim.x * gridDim.x;
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    // step counter
-    int curStep = step;
-    int nextStep = curStep + 1;
-    // continue flag for each thread
-    int flag = 0;
-    // proceeding loop
-    for (; index < vertex_num; index += n) {
-        int i = vertex_id[index];
-        if (values[i] == curStep) {
-            for (int k = vertex_begin[index]; k < vertex_begin[index + 1]; k++) {
-                int dest = edge_dest[k];
-                if (values[dest] == 0) {
-                    values[dest] = nextStep;
-                    flag = 1;
-                }
-            }
-        }
-    }
-    if (flag) *continue_flag = 1;
-}
-
-// BFS algorithm on graph g, partitioned, run on vertices without inner loop
-static void gpu_bfs_vertex_part(
-    const Graph * const * const g,
-    const struct part_table * const t,
-    int * const values,
-    int const first_vertex
-) {
-    int step = 1, flag = 0;
-    float bfsTime = 0.0;
-    timer_start();
-    Auto_Utility();
-    int part_num = t->part_num;
-    // Allocate GPU buffer
-    int ** dev_vertex_begin = (int **) Calloc(part_num, sizeof(int *));
-    int ** dev_edge_dest = (int **) Calloc(part_num, sizeof(int *));
-    int ** dev_vertex_id = (int **) Calloc(part_num, sizeof(int *));
-    for (int i = 0; i < part_num; i++) {
-        int size = (g[i]->vertex_num + 1) * sizeof(int);
-        CudaBufferFill(dev_vertex_begin[i], size, g[i]->vertex_begin);
-        size = g[i]->edge_num * sizeof(int);
-        CudaBufferFill(dev_edge_dest[i], size, g[i]->edge_dest);
-        size = g[i]->vertex_num * sizeof(int);
-        CudaBufferFill(dev_vertex_id[i], size, t->part_vertex[i]);
-    }
-    CudaBufferZero(int, dev_value, t->vertex_num);
-    CudaBufferZero(int, dev_continue_flag, 1)
-    // Set Source Vertex Value (Little Endian)
-    CudaMemset(dev_value + first_vertex, 1, 1);
-    // Main Loop
-    do {
-        // Clear Flag
-        CudaMemset(dev_continue_flag, 0, sizeof(int));
-        // Launch Kernel for this Iteration
-        for (int i = 0; i < part_num; i++) {
-            CudaTimerBegin();
-            kernel_vertex_part<<<(g[i]->vertex_num + 255) / 256, 256>>>
-            (
-                g[i]->vertex_num,
-                dev_vertex_id[i],
-                dev_vertex_begin[i],
-                dev_edge_dest[i],
-                dev_value,
-                step,
-                dev_continue_flag
-            );
-            bfsTime += CudaTimerEnd();
-        }
-        // Copy Back Flag
-        CudaMemcpyD2H(&flag, dev_continue_flag, sizeof(int));
-        step++;
-    } while(flag);
-    // Copy Back Values
-    CudaMemcpyD2H(values, dev_value, t->vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tpart_vertex\tstep=%d\t", bfsTime, timer_stop(), step - 1);
-}
-
-// BFS algorithm on graph g, partitioned, run on vertices with inner loop
-static void gpu_bfs_vertex_part_loop(
-    const Graph * const * const g,
-    const struct part_table * const t,
-    int * const values,
-    int const first_vertex
-) {
-    int step = 1, flag = 0;
-    float bfsTime = 0.0;
-    timer_start();
-    Auto_Utility();
-    int part_num = t->part_num;
-    // Allocate GPU buffer
-    int ** dev_vertex_begin = (int **) Calloc(part_num, sizeof(int *));
-    int ** dev_edge_dest = (int **) Calloc(part_num, sizeof(int *));
-    int ** dev_vertex_id = (int **) Calloc(part_num, sizeof(int *));
-    for (int i = 0; i < part_num; i++) {
-        int size = (g[i]->vertex_num + 1) * sizeof(int);
-        CudaBufferFill(dev_vertex_begin[i], size, g[i]->vertex_begin);
-        size = g[i]->edge_num * sizeof(int);
-        CudaBufferFill(dev_edge_dest[i], size, g[i]->edge_dest);
-        size = g[i]->vertex_num * sizeof(int);
-        CudaBufferFill(dev_vertex_id[i], size, t->part_vertex[i]);
-    }
-    CudaBufferZero(int, dev_value, t->vertex_num);
-    CudaBufferZero(int, dev_continue_flag, 1)
-    // Set Source Vertex Value (Little Endian)
-    CudaMemset(dev_value + first_vertex, 1, 1);
-    // Main Loop
-    do {
-        // Clear Flag
-        CudaMemset(dev_continue_flag, 0, sizeof(int));
-        // Launch Kernel for this Iteration
-        for (int i = 0; i < part_num; i++) {
-            CudaTimerBegin();
-            kernel_vertex_part_loop<<<208, 128>>>
-            (
-                g[i]->vertex_num,
-                dev_vertex_id[i],
-                dev_vertex_begin[i],
-                dev_edge_dest[i],
-                dev_value,
-                step,
-                dev_continue_flag
-            );
-            bfsTime += CudaTimerEnd();
-        }
-        // Copy Back Flag
-        CudaMemcpyD2H(&flag, dev_continue_flag, sizeof(int));
-        step++;
-    } while(flag);
-    // Copy Back Values
-    CudaMemcpyD2H(values, dev_value, t->vertex_num * sizeof(int));
-    printf("\t%.2f\t%.2f\tpart_vertex_loop\tstep=%d\t", bfsTime, timer_stop(), step - 1);
-}
 
 // experiments of BFS on Graph g with Partition Table t and partitions
 void bfs_experiments(const Graph * const g) {
 
     // partition on the Graph
     printf("-------------------------------------------------------------------\n");
-    printf("Partitioning ... ");
-    timer_start();
-    struct part_table * t =
-        partition(g->vertex_num, g->edge_num, g->vertex_begin, g->edge_dest, 5);
-    if (t == NULL) {
-        perror("Failed !");
-        exit(1);
-    } else {
-        printf("%.2f ms ... ", timer_stop());
-    }
-    // get Partitions
-    printf("Get partitions ... ");
-    timer_start();
-    Graph ** part = get_cut_graphs(g, t);
-    if (part == NULL) {
-        perror("Failed !");
-        exit(1);
-    } else {
-        printf("%.2f ms\n", timer_stop());
-    }
 
     int * value_cpu = (int *) calloc(g->vertex_num, sizeof(int));
     int * value_gpu = (int *) calloc(g->vertex_num, sizeof(int));
@@ -564,29 +431,22 @@ void bfs_experiments(const Graph * const g) {
 
     printf("\tTime\tTotal\tTips\n");
     
-    bfs_on_cpu(g->vertex_num, g->vertex_begin, g->edge_dest, value_cpu, SOURCE_VERTEX);
-    //print_bfs_values(value_cpu, g->vertex_num);
-    /*
+    cpu_bfs_vertex(g->vertex_num, g->vertex_begin, g->edge_dest, value_cpu, SOURCE_VERTEX);
+ //   print_bfs_values(value_cpu, g->vertex_num);
+
+//    cpu_bfs_edge(g->edge_num,g->vertex_num, g->edge_src, g->edge_dest, value_cpu, SOURCE_VERTEX);
+ // print_bfs_values(value_cpu, g->vertex_num);
+ 
+    gpu_bfs_edge(g, value_gpu, SOURCE_VERTEX);
+    check_values(value_cpu, value_gpu, g->vertex_num);
     gpu_bfs_edge_loop(g, value_gpu, SOURCE_VERTEX);
     check_values(value_cpu, value_gpu, g->vertex_num);
-    */
-	gpu_bfs_edge_part_loop(part, t, value_gpu, SOURCE_VERTEX);
-    check_values(value_cpu, value_gpu, g->vertex_num);
-    /*
+
     gpu_bfs_vertex(g, value_gpu, SOURCE_VERTEX);
     check_values(value_cpu, value_gpu, g->vertex_num);
     gpu_bfs_vertex_loop(g, value_gpu, SOURCE_VERTEX);
     check_values(value_cpu, value_gpu, g->vertex_num);
     
-	gpu_bfs_vertex_part(part, t, value_gpu, SOURCE_VERTEX);
-    check_values(value_cpu, value_gpu, g->vertex_num);
-    gpu_bfs_vertex_part_loop(part, t, value_gpu, SOURCE_VERTEX);
-    check_values(value_cpu, value_gpu, g->vertex_num);
-    */
-
-    release_table(t);
-    for (int i = 0; i < 5; i++) release_graph(part[i]);
-    free(part);
     free(value_cpu);
     free(value_gpu);
 }
